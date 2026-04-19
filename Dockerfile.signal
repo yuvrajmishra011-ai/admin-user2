@@ -1,0 +1,33 @@
+# Use a lightweight Node image
+FROM node:25-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+# Copy server code
+COPY server/ ./server/
+COPY tsconfig.json ./
+
+# Compile TypeScript if needed, or just install tsx to run it
+# For a production signaling server, running with tsx is fine for small-scale
+# but compiling is better. Let's just use tsx for simplicity in this setup.
+RUN npm install -g tsx
+
+# Final image
+FROM node:25-alpine
+WORKDIR /app
+
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/server ./server
+COPY --from=builder /usr/local/lib/node_modules /usr/local/lib/node_modules
+COPY --from=builder /usr/local/bin/tsx /usr/local/bin/tsx
+
+EXPOSE 3002
+
+ENV NODE_ENV production
+ENV SIGNALING_PORT 3002
+
+CMD ["tsx", "server/signaling.ts"]
