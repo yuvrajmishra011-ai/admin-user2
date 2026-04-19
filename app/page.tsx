@@ -1,5 +1,5 @@
-import LiveMonitor from "@/components/LiveMonitor";
+import LandingPage from "@/components/LandingPage";
 
 export default function HomePage() {
-  return <LiveMonitor />;
+  return <LandingPage />;
 }
