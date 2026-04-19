@@ -19,13 +19,21 @@ interface SignalingMessage {
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
+  {
+    urls: "turn:openrelay.metered.ca:80",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  {
+    urls: "turn:openrelay.metered.ca:443",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
 ];
 
 // ── Hook ───────────────────────────────────────────────────────────────────────
 export function useWebRTC(
-  signalingUrl: string = typeof window !== "undefined"
-    ? process.env.NEXT_PUBLIC_SIGNALING_URL || `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname}:3002`
-    : "ws://localhost:3002"
+  signalingUrl: string | undefined = undefined
 ) {
   const [state, setState] = useState<WebRTCState>({
     status: "idle",
@@ -56,6 +64,9 @@ export function useWebRTC(
   // ── Init ───────────────────────────────────────────────────────────────────
   useEffect(() => {
     let cancelled = false;
+    let localSocket: Socket | null = null;
+    let localPc: RTCPeerConnection | null = null;
+    let localStream: MediaStream | null = null;
 
     async function start() {
       try {
@@ -73,28 +84,31 @@ export function useWebRTC(
         }
 
         streamRef.current = stream;
+        localStream = stream;
         setState((s) => ({ ...s, localStream: stream }));
 
         // 2. Connect to signaling server
-        const socket = io(signalingUrl, {
+        console.log("[WebRTC Client] Initializing unified WebSocket connection...");
+        localSocket = io(signalingUrl, {
           transports: ["websocket"],
           reconnectionAttempts: 5,
         });
-        socketRef.current = socket;
+        socketRef.current = localSocket;
 
         // 3. Create peer connection
-        const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-        pcRef.current = pc;
+        localPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+        pcRef.current = localPc;
 
         // Add tracks to peer connection
         stream.getTracks().forEach((track) => {
-          pc.addTrack(track, stream);
+          localPc!.addTrack(track, stream);
         });
 
         // ICE candidates → send to admin via signaling
-        pc.onicecandidate = (e) => {
-          if (e.candidate && socketRef.current) {
-            socketRef.current.emit("signal", {
+        localPc.onicecandidate = (e) => {
+          if (e.candidate && localSocket && !cancelled) {
+            console.log("[WebRTC Client] ❄️ Generated ICE Candidate, sending to Admin...");
+            localSocket.emit("signal", {
               type: "ice-candidate",
               payload: e.candidate.toJSON(),
               sender: "client",
@@ -102,8 +116,16 @@ export function useWebRTC(
           }
         };
 
-        pc.onconnectionstatechange = () => {
-          const s = pc.connectionState;
+        // Track ICE Connection State for debugging NAT traversal
+        localPc.oniceconnectionstatechange = () => {
+          if (cancelled || !localPc) return;
+          console.log(`[WebRTC Client] ICE Connection State: ${localPc.iceConnectionState}`);
+        };
+
+        localPc.onconnectionstatechange = () => {
+          if (cancelled || !localPc) return;
+          console.log(`[WebRTC Client] Connection state: ${localPc.connectionState}`);
+          const s = localPc.connectionState;
           if (s === "connected") {
             setState((prev) => ({ ...prev, status: "connected" }));
           } else if (s === "failed" || s === "disconnected") {
@@ -116,48 +138,56 @@ export function useWebRTC(
         };
 
         // Handle signaling messages from admin
-        socket.on("signal", async (msg: SignalingMessage) => {
-          if (msg.sender === "admin") {
-            if (msg.type === "answer" && pc.signalingState === "have-local-offer") {
-              await pc.setRemoteDescription(
-                new RTCSessionDescription(msg.payload)
-              );
-            } else if (msg.type === "ice-candidate") {
-              try {
-                await pc.addIceCandidate(new RTCIceCandidate(msg.payload));
-              } catch {
-                // Ignore ICE errors for candidates arriving before remote desc
-              }
+        localSocket.on("signal", async (msg: SignalingMessage) => {
+          if (cancelled || !localPc || msg.sender !== "admin") return;
+          
+          if (localPc.signalingState === "closed") return;
+
+          if (msg.type === "answer" && localPc.signalingState === "have-local-offer") {
+            try {
+              await localPc.setRemoteDescription(new RTCSessionDescription(msg.payload));
+              console.log("[WebRTC Client] Remote answer set successfully");
+            } catch (err) {
+              if (!cancelled) console.error("[WebRTC Client] Failed to set remote answer:", err);
+            }
+          } else if (msg.type === "ice-candidate" && localPc.remoteDescription) {
+            try {
+              console.log("[WebRTC Client] 🧊 Received ICE Candidate from Admin, adding...");
+              await localPc.addIceCandidate(new RTCIceCandidate(msg.payload));
+            } catch (err) {
+              console.error("[WebRTC Client] Failed to add ICE candidate:", err);
             }
           }
         });
 
         // When signaling connects, create offer
-        socket.on("connect", async () => {
-          // Wait briefly for admin to connect
-          socket.emit("join", { role: "client" });
+        localSocket.on("connect", () => {
+          if (cancelled) return;
+          console.log("[WebRTC Client] Connected to signaling, joining room...");
+          localSocket!.emit("join", { role: "client" });
         });
 
         // Admin requests an offer
-        socket.on("request-offer", async () => {
-          console.log("[WebRTC] Received request-offer from signaling");
-          if (!pcRef.current) return;
+        localSocket.on("request-offer", async () => {
+          if (cancelled || !localPc) return;
+          console.log("[WebRTC Client] Received request-offer from signaling");
           
-          // If we are already connected, we might need to re-negotiate
-          // In some cases, resetting the PC might be cleaner, 
-          // but for now we just create a fresh offer.
           try {
-            const offer = await pcRef.current.createOffer({ iceRestart: true });
-            await pcRef.current.setLocalDescription(offer);
+            if (localPc.signalingState === "closed") return;
+            const offer = await localPc.createOffer({ iceRestart: true });
             
-            console.log("[WebRTC] Sending offer to admin...");
-            socket.emit("signal", {
+            if (cancelled || localPc.signalingState === "closed") return;
+            await localPc.setLocalDescription(offer);
+            
+            if (cancelled || localPc.signalingState === "closed") return;
+            console.log("[WebRTC Client] Sending offer to admin...");
+            localSocket!.emit("signal", {
               type: "offer",
               payload: offer,
               sender: "client",
             } as SignalingMessage);
           } catch (err) {
-            console.error("[WebRTC] Failed to create offer:", err);
+            if (!cancelled) console.error("[WebRTC Client] Failed to create offer:", err);
           }
         });
       } catch (err: any) {
@@ -174,10 +204,19 @@ export function useWebRTC(
     start();
 
     return () => {
+      console.log("[WebRTC Client] Cleaning up connection singleton...");
       cancelled = true;
-      cleanup();
+      if (localPc) {
+        localPc.close();
+      }
+      if (localSocket) {
+        localSocket.disconnect();
+      }
+      if (localStream) {
+        localStream.getTracks().forEach((t) => t.stop());
+      }
     };
-  }, [signalingUrl, cleanup]);
+  }, [signalingUrl]);
 
   return state;
 }

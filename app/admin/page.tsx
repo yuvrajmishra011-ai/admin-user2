@@ -8,6 +8,16 @@ import styles from "./admin.module.css";
 const ICE_SERVERS: RTCIceServer[] = [
   { urls: "stun:stun.l.google.com:19302" },
   { urls: "stun:stun1.l.google.com:19302" },
+  {
+    urls: "turn:openrelay.metered.ca:80",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+  {
+    urls: "turn:openrelay.metered.ca:443",
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
 ];
 
 export default function AdminPage() {
@@ -20,23 +30,22 @@ export default function AdminPage() {
   const [metricsLog, setMetricsLog] = useState<MetricsPacket[]>([]);
 
   useEffect(() => {
-    const signalingUrl =
-      process.env.NEXT_PUBLIC_SIGNALING_URL ||
-      (typeof window !== "undefined"
-        ? `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname}:3002`
-        : "ws://localhost:3002");
-
-    const socket = io(signalingUrl, {
+    let cancelled = false;
+    
+    // Ensure singletons per mount lifecycle
+    console.log("[Admin] Initializing unified WebSocket connection...");
+    const localSocket = io(undefined, {
       transports: ["websocket"],
       reconnectionAttempts: 10,
     });
-    socketRef.current = socket;
+    socketRef.current = localSocket;
 
-    const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
-    pcRef.current = pc;
+    const localPc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+    pcRef.current = localPc;
 
     // Receive remote stream
-    pc.ontrack = (event) => {
+    localPc.ontrack = (event) => {
+      if (cancelled) return;
       console.log("[Admin] Remote stream received:", event.streams[0]);
       if (videoRef.current && event.streams[0]) {
         videoRef.current.srcObject = event.streams[0];
@@ -44,9 +53,10 @@ export default function AdminPage() {
       }
     };
 
-    pc.onicecandidate = (e) => {
-      if (e.candidate && socketRef.current) {
-        socketRef.current.emit("signal", {
+    localPc.onicecandidate = (e) => {
+      if (e.candidate && localSocket && !cancelled) {
+        console.log("[Admin] ❄️ Generated ICE Candidate, sending to Client...");
+        localSocket.emit("signal", {
           type: "ice-candidate",
           payload: e.candidate.toJSON(),
           sender: "admin",
@@ -54,67 +64,92 @@ export default function AdminPage() {
       }
     };
 
-    pc.onconnectionstatechange = () => {
-      console.log("[Admin] Connection state:", pc.connectionState);
-      if (pc.connectionState === "connected") setConnected(true);
-      if (pc.connectionState === "failed" || pc.connectionState === "disconnected")
+    localPc.oniceconnectionstatechange = () => {
+      if (cancelled) return;
+      console.log(`[Admin] ICE Connection State: ${localPc.iceConnectionState}`);
+    };
+
+    localPc.onconnectionstatechange = () => {
+      if (cancelled) return;
+      console.log("[Admin] Connection state:", localPc.connectionState);
+      if (localPc.connectionState === "connected") setConnected(true);
+      if (localPc.connectionState === "failed" || localPc.connectionState === "disconnected")
         setConnected(false);
     };
 
     // Handle signaling
-    socket.on("signal", async (msg: { type: string; payload: any; sender: string }) => {
-      if (msg.sender !== "client") return;
+    localSocket.on("signal", async (msg: { type: string; payload: any; sender: string }) => {
+      if (cancelled || msg.sender !== "client" || localPc.signalingState === "closed") return;
 
       if (msg.type === "offer") {
-        console.log("[Admin] Received offer from client");
-        await pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
-        const answer = await pc.createAnswer();
-        await pc.setLocalDescription(answer);
-        socket.emit("signal", {
-          type: "answer",
-          payload: answer,
-          sender: "admin",
-        });
+        console.log("[Admin] 📥 Received offer from client");
+        try {
+          await localPc.setRemoteDescription(new RTCSessionDescription(msg.payload));
+          if (cancelled || localPc.signalingState === "closed") return;
+          
+          const answer = await localPc.createAnswer();
+          if (cancelled || localPc.signalingState === "closed") return;
+          
+          await localPc.setLocalDescription(answer);
+          if (cancelled || localPc.signalingState === "closed") return;
+          
+          console.log("[Admin] 📤 Sending answer back to client");
+          localSocket.emit("signal", {
+            type: "answer",
+            payload: answer,
+            sender: "admin",
+          });
+        } catch (err) {
+          if (!cancelled) console.error("[Admin] Offer processing failed:", err);
+        }
       } else if (msg.type === "ice-candidate") {
         try {
-          await pc.addIceCandidate(new RTCIceCandidate(msg.payload));
-        } catch {
-          // ignore
+          console.log("[Admin] 🧊 Received ICE Candidate from Client, adding...");
+          await localPc.addIceCandidate(new RTCIceCandidate(msg.payload));
+        } catch (err) {
+          console.error("[Admin] Failed to add ICE candidate:", err);
         }
       }
     });
 
     // Receive metrics
-    socket.on("metrics", (packet: MetricsPacket) => {
+    localSocket.on("metrics", (packet: MetricsPacket) => {
+      if (cancelled) return;
       setMetrics(packet);
       setMetricsLog((prev) => [...prev.slice(-50), packet]); // keep last 50
     });
 
-    socket.on("client-disconnected", () => {
+    localSocket.on("client-disconnected", () => {
+      if (cancelled) return;
+      console.log("[Admin] 🔴 Client disconnected");
       setConnected(false);
       if (videoRef.current) videoRef.current.srcObject = null;
     });
 
-    socket.on("connect", () => {
-      console.log("[Admin] Connected to signaling, joining room...");
-      socket.emit("join", { role: "admin" });
+    localSocket.on("connect", () => {
+      if (cancelled) return;
+      console.log("[Admin] 🟢 Connected to signaling, joining room...");
+      localSocket.emit("join", { role: "admin" });
       
       // Request offer immediately on connect
-      socket.emit("request-offer");
+      localSocket.emit("request-offer");
     });
 
     // POLLING: Periodically request offer if not connected
     const pollInterval = setInterval(() => {
+      if (cancelled) return;
       if (!pcRef.current || pcRef.current.connectionState !== "connected") {
-        console.log("[Admin] Not connected, retrying handshake...");
-        socket.emit("request-offer");
+        console.log("[Admin] Handshake poll: Not connected, requesting offer...");
+        localSocket.emit("request-offer");
       }
     }, 3000);
 
     return () => {
+      console.log("[Admin] 🧹 Cleaning up connection singleton...");
+      cancelled = true;
       clearInterval(pollInterval);
-      pc.close();
-      socket.disconnect();
+      if (localPc) localPc.close();
+      if (localSocket) localSocket.disconnect();
     };
   }, []);
 

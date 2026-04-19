@@ -24,9 +24,7 @@ const INTERVAL_MS = Math.round(1000 / TARGET_FPS);
 export function useMetricsSender(
   livenessData: LivenessData,
   typingMetrics: TypingMetrics,
-  signalingUrl: string = typeof window !== "undefined"
-    ? process.env.NEXT_PUBLIC_SIGNALING_URL || `${window.location.protocol === "https:" ? "wss" : "ws"}://${window.location.hostname}:3002`
-    : "ws://localhost:3002"
+  signalingUrl: string | undefined = undefined
 ) {
   const socketRef = useRef<Socket | null>(null);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -38,14 +36,36 @@ export function useMetricsSender(
   const typingRef = useRef(typingMetrics);
   typingRef.current = typingMetrics;
 
-  // ── Tab visibility ─────────────────────────────────────────────────────────
+  // ── Tab visibility (with hysteresis to prevent shivering) ───────────────────
   useEffect(() => {
+    let hideTimer: ReturnType<typeof setTimeout> | null = null;
+
     const handleVisibility = () => {
-      tabActiveRef.current = document.visibilityState === "visible";
+      const state = document.visibilityState;
+      
+      if (state === "visible") {
+        // Switch back to active instantly
+        if (hideTimer) {
+          clearTimeout(hideTimer);
+          hideTimer = null;
+        }
+        tabActiveRef.current = true;
+      } else {
+        // Only mark as hidden if it stays hidden for > 500ms
+        if (!hideTimer) {
+          hideTimer = setTimeout(() => {
+            tabActiveRef.current = false;
+            hideTimer = null;
+          }, 500);
+        }
+      }
     };
+
     document.addEventListener("visibilitychange", handleVisibility);
-    return () =>
+    return () => {
       document.removeEventListener("visibilitychange", handleVisibility);
+      if (hideTimer) clearTimeout(hideTimer);
+    };
   }, []);
 
   // ── Socket connection + sending loop ───────────────────────────────────────

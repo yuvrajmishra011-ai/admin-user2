@@ -76,7 +76,7 @@ io.on("connection", (socket) => {
   });
 });
 
-httpServer.listen(PORT, () => {
-  console.log(`\n🚀 VeriStream Hardened Signaling Server running on port ${PORT}`);
+httpServer.listen(PORT, "0.0.0.0", () => {
+  console.log(`\n🚀 VeriStream Hardened Signaling Server running on all interfaces at port ${PORT}`);
   console.log(`   Session Room: ${ROOM_NAME}\n`);
 });
